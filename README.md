@@ -1,5 +1,5 @@
 # cloudwatch-logs-automator
-Automate delivery of CloudWatch Logs to Splunk
+Automate delivery of new and existing CloudWatch Logs to Splunk
 
 ## Kudos
 This is a Python rewrite of the SumoLogic LogGroup Connector:

@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Automatically send CloudWatch Logs to Splunk
+Globals:
+  Function:
+    MemorySize: 128
+    Timeout: 30
+    VpcConfig:
+      SecurityGroupIds:
+        - !Select [ 0, !Ref SecurityGroups ]
+      SubnetIds:
+        - Fn::ImportValue: !Sub
+            - ${StackName}-PrivateSubnet1AID
+            - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", VpcStackName]
+        - Fn::ImportValue: !Sub
+            - ${StackName}-PrivateSubnet2AID
+            - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", VpcStackName]
+    KmsKeyArn: !If
+      - GOVCLOUD
+      - Fn::ImportValue: !Sub
+          - ${StackName}-LambdaKeyArn
+          - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", KmsStackName]
+      - !Ref 'AWS::NoValue'
+    DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt SqsDlQueue.Arn
+Parameters:
+  SecurityGroups:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: List of security group SecurityGroupIds
+    Default: sg-73a7fe16
+  LogGroupPattern:
+    Type: String
+    Default: "/aws/lambda"
+    Description: "Enter regex for matching logGroups"
+  UseExistingLogs:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Select true for subscribing existing logs"
+  LogGroupTags:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "Enter comma separated keyvalue pairs for filtering logGroups using tags. Ex KeyName1=string,KeyName2=string. This is optional leave it blank if tag based filtering is not needed."
+  SplunkHttpEventCollectorToken:
+    Type: String
+    Description: Splunk HEC Token
+    NoEcho: true
+Conditions:
+  GOVCLOUD: !Equals [!Ref 'AWS::Partition', 'aws-us-gov']
+Mappings:
+  PartitionMap:
+    aws-us-gov:
+      VpcStackName: NewVCP-with2Subnets
+      KmsStackName: ECSO-IAM-KMS
+      SnsAlarmStackName: FCS-TECH-TEAM-SNS
+      SplunkHttpEventCollectorURL: 'https://splunk-hf.primrosenet.net:443/services/collector'
+Resources:
+  CloudWatchLogsSubscriberFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/index.py
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Environment:
+        Variables:
+          PARTITION: !Ref 'AWS::Partition'
+          REGION: !Ref 'AWS::Region'
+          LAMBDA_ARN: !GetAtt SplunkCloudWatchLogsProcessorFunction.Arn
+          LOG_GROUP_PATTERN: !Ref LogGroupPattern
+          USE_EXISTING_LOG_GROUPS: !Ref UseExistingLogs
+          LOG_GROUP_TAGS: !Join [",", {"Ref": "LogGroupTags"} ]
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+        - Statement:
+          - Sid: ReadWriteFilterPolicy
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:PutSubscriptionFilter
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+          - Sid: AllowSQSDlq
+            Effect: Allow
+            Action:
+            - sqs:SendMessage
+            Resource:
+              - !GetAtt SqsDlQueue.Arn
+      Events:
+        LambdaTrigger:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              source:
+                - aws.logs
+              detail:
+                eventSource:
+                  - logs.amazonaws.com
+                eventName:
+                  - CreateLogGroup
+  CloudWatchLogsSubscriberFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CloudWatchLogsSubscriberFunction}
+  CWLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SplunkCloudWatchLogsProcessorFunction
+      Principal: !Sub 'logs.${AWS::Region}.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*'
+  SplunkCloudWatchLogsProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs10.x
+      CodeUri: src/splunk-cloudwatch-logs-processor.zip
+      Description: Stream events from AWS CloudWatch Logs to Splunk HTTP event collector
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          SPLUNK_HEC_URL: !FindInMap [PartitionMap, !Ref "AWS::Partition", SplunkHttpEventCollectorURL]
+          SPLUNK_HEC_TOKEN: !Ref SplunkHttpEventCollectorToken
+  CloudWatchLogsSubscriberFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: When an Lambda error occurs, it will be notified via SNS
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref CloudWatchLogsSubscriberFunction
+      Statistic: Sum
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      Period: 60
+      EvaluationPeriods: 1
+      AlarmActions:
+        - Fn::ImportValue: !Sub
+          - ${StackName}-SnsTopicArn
+          - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", SnsAlarmStackName]
+      TreatMissingData: notBreaching
+  SqsDlQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      KmsMasterKeyId: 
+        Fn::ImportValue: !Sub
+          - ${StackName}-SQSKeyArn
+          - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", KmsStackName]
+  SqsDlQueueDepthAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Alarm if queue depth grows beyond 0 messages
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SqsDlQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Fn::ImportValue: !Sub
+            - ${StackName}-SnsTopicArn
+            - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", SnsAlarmStackName]
+      TreatMissingData: notBreaching

@@ -7,28 +7,24 @@ Globals:
     Timeout: 30
     VpcConfig:
       SecurityGroupIds:
-        - !Select [ 0, !Ref SecurityGroups ]
+        - !Ref SecurityGroup
       SubnetIds:
-        - Fn::ImportValue: !Sub
-            - ${StackName}-PrivateSubnet1AID
-            - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", VpcStackName]
-        - Fn::ImportValue: !Sub
-            - ${StackName}-PrivateSubnet2AID
-            - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", VpcStackName]
-    KmsKeyArn: !If
-      - GOVCLOUD
-      - Fn::ImportValue: !Sub
-          - ${StackName}-LambdaKeyArn
-          - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", KmsStackName]
-      - !Ref 'AWS::NoValue'
+        - !Select [ 0, !Ref SubnetIds ]
+        - !Select [ 1, !Ref SubnetIds ]
+    KmsKeyArn: !Ref KmsKeyArn
     DeadLetterQueue:
-        Type: SQS
-        TargetArn: !GetAtt SqsDlQueue.Arn
+      Type: SQS
+      TargetArn: !GetAtt SqsDlQueue.Arn
 Parameters:
-  SecurityGroups:
-    Type: List<AWS::EC2::SecurityGroup::Id>
-    Description: List of security group SecurityGroupIds
-    Default: sg-73a7fe16
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of Subnet Ids (select 2)
+  KmsKeyArn:
+    Type: String
+    Description: "Enter KMS Key ARN used for encryption"
   LogGroupPattern:
     Type: String
     Default: "/aws/lambda"
@@ -46,15 +42,10 @@ Parameters:
     Type: String
     Description: Splunk HEC Token
     NoEcho: true
-Conditions:
-  GOVCLOUD: !Equals [!Ref 'AWS::Partition', 'aws-us-gov']
-Mappings:
-  PartitionMap:
-    aws-us-gov:
-      VpcStackName: NewVCP-with2Subnets
-      KmsStackName: ECSO-IAM-KMS
-      SnsAlarmStackName: FCS-TECH-TEAM-SNS
-      SplunkHttpEventCollectorURL: 'https://splunk-hf.primrosenet.net:443/services/collector'
+  SplunkHttpEventCollectorURL:
+    Type: String
+    Description: Splunk HEC URL
+    Default: https://url:8088/services/collector
 Resources:
   CloudWatchLogsSubscriberFunction:
     Type: AWS::Serverless::Function
@@ -118,13 +109,13 @@ Resources:
     Properties:
       Handler: index.handler
       Runtime: nodejs10.x
-      CodeUri: src/splunk-cloudwatch-logs-processor.zip
+      CodeUri: src/
       Description: Stream events from AWS CloudWatch Logs to Splunk HTTP event collector
       MemorySize: 512
       Timeout: 30
       Environment:
         Variables:
-          SPLUNK_HEC_URL: !FindInMap [PartitionMap, !Ref "AWS::Partition", SplunkHttpEventCollectorURL]
+          SPLUNK_HEC_URL: !Ref SplunkHttpEventCollectorURL
           SPLUNK_HEC_TOKEN: !Ref SplunkHttpEventCollectorToken
   CloudWatchLogsSubscriberFunctionErrorAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -141,17 +132,12 @@ Resources:
       Period: 60
       EvaluationPeriods: 1
       AlarmActions:
-        - Fn::ImportValue: !Sub
-          - ${StackName}-SnsTopicArn
-          - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", SnsAlarmStackName]
+        - !Ref SnsTopicArn
       TreatMissingData: notBreaching
   SqsDlQueue:
     Type: 'AWS::SQS::Queue'
     Properties:
-      KmsMasterKeyId: 
-        Fn::ImportValue: !Sub
-          - ${StackName}-SQSKeyArn
-          - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", KmsStackName]
+      KmsMasterKeyId: !Ref KmsKeyId
   SqsDlQueueDepthAlarm:
     Type: 'AWS::CloudWatch::Alarm'
     Properties:
@@ -167,7 +153,5 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
-        - Fn::ImportValue: !Sub
-            - ${StackName}-SnsTopicArn
-            - StackName: !FindInMap [PartitionMap, !Ref "AWS::Partition", SnsAlarmStackName]
+        - !Ref SnsTopicArn
       TreatMissingData: notBreaching
